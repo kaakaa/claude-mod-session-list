@@ -1,10 +1,11 @@
 export type SessionRow = {
   id: string
   title: string
+  /** The name of the directory the session started in (a worktree's project's). */
   project: string
-  /** Local time, `YYYY-MM-DD HH:MM`. */
-  started: string
-  updated: string
+  isWorktree?: boolean
+  /** Epoch seconds of the first record, if it has a timestamp. */
+  startedAt?: number
   /** Epoch seconds of the last write, for sorting. */
   updatedAt: number
   /** Which scan wrote the row; an older one is scanned again. */
@@ -19,11 +20,14 @@ export type SessionRow = {
   prUrl?: string
   /** `claude-desktop`, `cli`, ... */
   entrypoint?: string
-  /** The directory the session started in, `~` for the home directory. */
-  path?: string
 }
 
-export type Listing = { rows: SessionRow[]; error: string | null }
+export type Listing = {
+  rows: SessionRow[]
+  error: string | null
+  /** The machine's offset from UTC in seconds, so dates read as its own. */
+  utcOffset?: number
+}
 
 declare module 'claude-code' {
   interface PluginState {

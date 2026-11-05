@@ -2,12 +2,10 @@
 
 A Claude Code mod that lists the Claude Code sessions on this machine in a pane.
 
-Run `/sessions` to open it. Sessions are grouped into Today / This week / Earlier, newest first, and each card shows:
+Run `/sessions` to open it. Sessions are grouped into Today / This week / Earlier, newest first, and each card is two lines:
 
-- where it was started (Desktop, CLI, VS Code, SDK) and its title
-- the project, git branch and model
-- the directory it started in
-- when it started, how long ago it was last updated, its cost, lines added/removed and any linked PR
+- where it was started (Desktop, CLI, VS Code, SDK), its title, and when it ran (`10/8 → 22:19`: hours for today, a date before)
+- 📁 the directory it started in, ⎇ its git branch, lines added/removed and any linked PR on the left; the model and cost on the right
 
 The ⧉ button copies the session ID to the clipboard, and ↻ Refresh scans again. Only transcripts that changed since the last scan are read again.
 
