@@ -4,21 +4,19 @@ import type { EngineInterface, Register, RenderSurface } from 'claude-code'
 import type { Listing, SessionRow } from '../types'
 
 const PANE = 'session-list'
-const SCAN = 3
+const SCAN = 4
 const listing = atom({ plugin: 'session-list', key: 'listing' } as const, null)
 
-// One grep pass per transcript pulls the fields out; awk keeps the last value
-// of each (the first for the start and the entrypoint) and prints them
-// tab-separated, the start as ISO. The shell turns times into local time with
-// `date`, so the module needs no time zone of its own. A transcript whose
-// "id:mtime" is in $KNOWN has not changed since the last scan: it prints
-// "KEEP <id>" and the module reuses the row it holds.
+// The first line is "TZ <offset>" (`date +%z`, e.g. +0900). Then one line per
+// transcript: a grep pass pulls the fields out and awk keeps the last value of
+// each (the first for the start, the entrypoint and the cwd), tab-separated.
+// A transcript whose "id:mtime" is in $KNOWN has not changed since the last
+// scan: it prints "KEEP <id>" and the module reuses the row it holds.
 const SCRIPT = `
-fmt() { date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null || date -d "@$1" '+%Y-%m-%d %H:%M'; }
+printf 'TZ\\t%s\\n' "$(date +%z)"
 for f in "$HOME"/.claude/projects/*/*.jsonl; do
   [ -f "$f" ] || continue
   id=$(basename "$f" .jsonl)
-  proj=$(basename "$(dirname "$f")")
   m=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f")
   case " $KNOWN " in *" $id:$m "*) printf 'KEEP\\t%s\\n' "$id"; continue;; esac
   rest=$(grep -oE '"(timestamp|entrypoint|cwd|customTitle|lastPrompt|gitBranch|prUrl)":"[^"]*"|"model":"claude-[^"]*"|"(totalCostUSD|totalLinesAdded|totalLinesRemoved|prNumber)":[0-9.]+' "$f" | awk -F'"' '
@@ -31,29 +29,22 @@ for f in "$HOME"/.claude/projects/*/*.jsonl; do
     }')
   iso=\${rest%%\t*}
   s=""
-  if [ -n "$iso" ]; then
-    e=$(date -j -u -f '%Y-%m-%dT%H:%M:%S' "\${iso%%.*}" '+%s' 2>/dev/null || date -d "$iso" '+%s')
-    s=$(fmt "$e")
-  fi
-  printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' "$id" "$proj" "$m" "$s" "$(fmt "$m")" "\${rest#*\t}"
+  [ -n "$iso" ] && s=$(date -j -u -f '%Y-%m-%dT%H:%M:%S' "\${iso%%.*}" '+%s' 2>/dev/null || date -d "$iso" '+%s')
+  printf '%s\\t%s\\t%s\\t%s\\n' "$id" "$m" "$s" "\${rest#*\t}"
 done
 `
 
-// "/…/src/app/.claude/worktrees/fix-x" → "app (worktree fix-x)". Without a cwd only the transcript's folder name is left,
-// the path with "/" spelled "-", which no longer tells a "-" in a name apart.
-function projectName(cwd: string | undefined, folder: string) {
-  if (!cwd) return folder
+// "/…/src/app" → "app"; a worktree's "/…/src/app/.claude/worktrees/fix-x" is
+// the project's too, "app", marked as a worktree.
+function directory(cwd: string | undefined) {
+  if (!cwd) return { project: '?', isWorktree: false }
 
   const [main = cwd, worktree] = cwd.split('/.claude/worktrees/')
-  const name = main.split('/').filter(Boolean).slice(-1)[0] ?? main
 
-  return worktree ? `${name} (worktree ${worktree})` : name
-}
-
-function shortPath(path: string | undefined, home: string | undefined) {
-  if (!path) return undefined
-
-  return home && path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path
+  return {
+    project: main.split('/').filter(Boolean).slice(-1)[0] ?? main,
+    isWorktree: worktree !== undefined,
+  }
 }
 
 const ORIGIN: Record<string, string> = {
@@ -71,19 +62,28 @@ function originName(entrypoint: string | undefined) {
 const num = (text: string | undefined) => (text ? Number(text) : undefined)
 const str = (text: string | undefined) => (text ? text : undefined)
 
-function parse(
-  stdout: string,
-  known: readonly SessionRow[],
-  home: string | undefined,
-): SessionRow[] {
-  const byId = new Map(known.map(row => [row.id, row]))
+// "+0900" → 32400
+function offsetSeconds(tz: string | undefined) {
+  const [, sign, hours, minutes] = /^([+-])(\d{2})(\d{2})$/.exec(tz ?? '') ?? []
+  if (!sign) return 0
 
-  return stdout
+  return (sign === '-' ? -1 : 1) * (Number(hours) * 3600 + Number(minutes) * 60)
+}
+
+function parse(stdout: string, known: readonly SessionRow[]): Listing {
+  const byId = new Map(known.map(row => [row.id, row]))
+  let utcOffset = 0
+  const rows = stdout
     .split('\n')
     .filter(line => line.trim() !== '')
     .flatMap((line): SessionRow[] => {
       const f = line.split('\t')
 
+      if (f[0] === 'TZ') {
+        utcOffset = offsetSeconds(f[1])
+
+        return []
+      }
       if (f[0] === 'KEEP') {
         const kept = byId.get(f[1] ?? '')
 
@@ -92,39 +92,56 @@ function parse(
 
       return [{
         id: f[0] ?? '',
-        project: projectName(str(f[14]), f[1] ?? ''),
-        path: shortPath(str(f[14]), home),
-        updatedAt: Number(f[2] ?? 0),
+        updatedAt: Number(f[1] ?? 0),
+        startedAt: num(f[2]),
         scan: SCAN,
-        started: f[3] ?? '',
-        updated: f[4] ?? '',
-        title: f[5] || '(untitled)',
-        branch: str(f[6]),
-        model: str(f[7]),
-        costUsd: num(f[8]),
-        linesAdded: num(f[9]),
-        linesRemoved: num(f[10]),
-        prNumber: num(f[11]),
-        prUrl: str(f[12]),
-        entrypoint: str(f[13]),
+        title: f[3] || '(untitled)',
+        branch: str(f[4]),
+        model: str(f[5]),
+        costUsd: num(f[6]),
+        linesAdded: num(f[7]),
+        linesRemoved: num(f[8]),
+        prNumber: num(f[9]),
+        prUrl: str(f[10]),
+        entrypoint: str(f[11]),
+        ...directory(str(f[12])),
       }]
     })
     .sort((a, b) => b.updatedAt - a.updatedAt)
+
+  return { rows, error: null, utcOffset }
 }
 
-// "2026-10-08 21:05" → "10/8"
-function shortDate(local: string) {
-  const [, month, day] = /^\d{4}-(\d{2})-(\d{2})/.exec(local) ?? []
+// A day number on the machine's own calendar.
+const dayOf = (epoch: number, offset: number) => Math.floor((epoch + offset) / 86400)
 
-  return month && day ? `${Number(month)}/${Number(day)}` : '?'
+// Today "14:05", this year "10/8", before that "2025/10/8": the same words for
+// a start and an end, so a span reads the same way at both ends.
+function when(epoch: number, now: number, offset: number) {
+  const local = new Date((epoch + offset) * 1000)
+  const pad = (n: number) => String(n).padStart(2, '0')
+
+  if (dayOf(epoch, offset) === dayOf(now, offset)) {
+    return `${pad(local.getUTCHours())}:${pad(local.getUTCMinutes())}`
+  }
+
+  const date = `${local.getUTCMonth() + 1}/${local.getUTCDate()}`
+  const thisYear = new Date((now + offset) * 1000).getUTCFullYear()
+
+  return local.getUTCFullYear() === thisYear ? date : `${local.getUTCFullYear()}/${date}`
 }
 
-function ago(seconds: number) {
-  if (seconds < 60) return 'just now'
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`
+// When the session ran: "10/8 → 14:05". One day's session names its day once,
+// unless it is today's, which is told by its hours.
+function span(row: SessionRow, now: number, offset: number) {
+  const end = when(row.updatedAt, now, offset)
+  if (row.startedAt === undefined) return end
 
-  return `${Math.floor(seconds / 86400)}d ago`
+  const start = when(row.startedAt, now, offset)
+  const isOneDay = dayOf(row.startedAt, offset) === dayOf(row.updatedAt, offset)
+  const isToday = dayOf(row.updatedAt, offset) === dayOf(now, offset)
+
+  return isOneDay && !isToday ? end : `${start} → ${end}`
 }
 
 // "claude-opus-5-5" → "Opus 5.5"
@@ -135,9 +152,10 @@ function modelName(id: string | undefined) {
   return `${family.charAt(0).toUpperCase()}${family.slice(1)} ${version.join('.')}`.trim()
 }
 
-function section(seconds: number) {
-  if (seconds < 86400) return 'Today'
-  if (seconds < 7 * 86400) return 'This week'
+function section(epoch: number, now: number, offset: number) {
+  const days = dayOf(now, offset) - dayOf(epoch, offset)
+  if (days === 0) return 'Today'
+  if (days < 7) return 'This week'
 
   return 'Earlier'
 }
@@ -160,7 +178,7 @@ async function refresh($: EngineInterface) {
     })
     next =
       run.exitCode === 0
-        ? { rows: parse(run.stdout, known, await $.env.get('HOME')), error: null }
+        ? parse(run.stdout, known)
         : { rows: [], error: run.stderr.trim().split('\n')[0] ?? 'listing failed' }
   } catch (error) {
     next = { rows: [], error: String(error) }
@@ -191,7 +209,10 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Button, Link, Text } = $.ui.resolve(e)
-    const state = await read($, listing)
+    const held = await read($, listing)
+    // Rows an older version scanned lack what this one draws: show none of
+    // them until the scan that replaces them is done.
+    const state = held?.rows.some(row => row.scan !== SCAN) ? null : held
 
     const refreshButton = (
       <Button key="refresh" label="↻ Refresh" plain dimColor onPress={() => refresh($)} />
@@ -207,12 +228,13 @@ export const register: Register = on => {
     }
     if (state.error) return <Text color="error">Could not list sessions: {state.error}</Text>
 
-    const now = (await $.clock.now()) / 1000
+    const now = Math.floor((await $.clock.now()) / 1000)
+    const offset = state.utcOffset ?? 0
     const total = state.rows.reduce((sum, row) => sum + (row.costUsd ?? 0), 0)
     const groups = ['Today', 'This week', 'Earlier']
       .map(name => ({
         name,
-        rows: state.rows.filter(row => section(now - row.updatedAt) === name),
+        rows: state.rows.filter(row => section(row.updatedAt, now, offset) === name),
       }))
       .filter(group => group.rows.length > 0)
 
@@ -246,6 +268,7 @@ export const register: Register = on => {
                 borderColor="subtle"
                 paddingX={1}
               >
+                {/* What it is and when it ran. */}
                 <Box flexDirection="row" gap={1} alignItems="center">
                   {originName(row.entrypoint) && (
                     <Text
@@ -261,8 +284,8 @@ export const register: Register = on => {
                       {row.title}
                     </Text>
                   </Box>
-                  <Text size="caption" dimColor>
-                    {ago(now - row.updatedAt)}
+                  <Text size="caption" dimColor tabular>
+                    {span(row, now, offset)}
                   </Text>
                   <Button
                     key={`copy-${row.id}`}
@@ -272,23 +295,15 @@ export const register: Register = on => {
                     onPress={press => copyId($, row.id, press.surface)}
                   />
                 </Box>
-                <Text size="caption" dimColor wrap="truncate-end">
-                  {[row.project, row.branch && row.branch !== 'HEAD' ? row.branch : undefined, modelName(row.model)]
-                    .filter(Boolean)
-                    .join(' · ')}
-                </Text>
-                {row.path && (
-                  <Text size="caption" dimColor mono wrap="truncate-middle">
-                    {row.path}
+                {/* Where it ran and what it changed on the left, what it cost on the right. */}
+                <Box flexDirection="row" gap={2} alignItems="center">
+                  <Text size="caption" dimColor wrap="truncate-end">
+                    📁 {row.project}
+                    {row.isWorktree ? ' (worktree)' : ''}
                   </Text>
-                )}
-                <Box flexDirection="row" gap={2}>
-                  <Text size="caption" dimColor>
-                    since {shortDate(row.started)}
-                  </Text>
-                  {row.costUsd !== undefined && (
-                    <Text size="caption" dimColor tabular>
-                      ${row.costUsd.toFixed(2)}
+                  {row.branch && row.branch !== 'HEAD' && (
+                    <Text size="caption" dimColor wrap="truncate-end">
+                      ⎇ {row.branch}
                     </Text>
                   )}
                   {(row.linesAdded ?? 0) + (row.linesRemoved ?? 0) > 0 && (
@@ -298,6 +313,15 @@ export const register: Register = on => {
                     </Text>
                   )}
                   {row.prUrl && <Link href={row.prUrl} label={`PR #${row.prNumber ?? ''}`} />}
+                  <Box flexGrow={1} />
+                  <Text size="caption" dimColor tabular>
+                    {[
+                      modelName(row.model),
+                      row.costUsd !== undefined ? `$${row.costUsd.toFixed(2)}` : undefined,
+                    ]
+                      .filter(Boolean)
+                      .join(' · ')}
+                  </Text>
                 </Box>
               </Box>
             ))}
