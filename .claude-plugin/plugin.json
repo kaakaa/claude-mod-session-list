@@ -1,0 +1,6 @@
+{
+  "name": "session-list",
+  "version": "0.1.0",
+  "description": "/sessions lists this machine's Claude Code sessions (name, id, started, last updated) in a pane.",
+  "types": "./types/index.d.ts"
+}
