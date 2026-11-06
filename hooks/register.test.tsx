@@ -20,6 +20,7 @@ const HOUR = 3600
 const row = (...fields: (string | number)[]) => fields.join('\t')
 const STDOUT = [
   'TZ\t+0900',
+  'TOTAL\t3\t3',
   // id, mtime, start, title, branch, model, cost, +, -, PR, PR url, entrypoint, cwd
   row('aaa', NOW - 72 * HOUR, Date.UTC(2026, 9, 1, 3) / 1000, 'Old one', 'main', 'claude-opus-5-5',
     '3.2971', '531', '93', '1', 'https://github.com/o/r/pull/1', 'claude-desktop', '/Users/me/src/older-repo'),
@@ -29,11 +30,26 @@ const STDOUT = [
     '', '', 'claude-desktop', '/Users/me/yamdes'),
 ].join('\n')
 
-function engine(on: Parameters<Parameters<typeof test>[1] & Function>[1], stdout: () => string, copied: string[]) {
+type Chunks = () => AsyncGenerator<{ stream: 'stdout'; text: string }, { code: number; signal: null }>
+
+// The scan's output, one piece per line, as a child would write it.
+const pieces = (stdout: string): Chunks =>
+  async function* () {
+    for (const line of stdout.split('\n')) yield { stream: 'stdout', text: `${line}\n` }
+
+    return { code: 0, signal: null }
+  }
+
+function engine(on: Parameters<Parameters<typeof test>[1] & Function>[1], chunks: () => Chunks, copied: string[]) {
   on('command.register', () => ({ value: { command: 'sessions' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
-  on('process.run', () => ({ value: { exitCode: 0, stdout: stdout(), stderr: '' } }))
-  on('clock.now', () => ({ value: NOW * 1000 }))
+  // A stand-in for the child: it yields the pieces, then answers how it ended.
+  on('process.spawn', async function* () {
+    return { value: yield* chunks()() }
+  })
+  // A quarter second passes on each look, so the scan's redraws are not held back.
+  let looks = 0
+  on('clock.now', () => ({ value: NOW * 1000 + 250 * looks++ }))
   on('ui.copy', (_, e) => {
     copied.push(e.text)
 
@@ -45,7 +61,7 @@ function engine(on: Parameters<Parameters<typeof test>[1] & Function>[1], stdout
 
 test('/sessions draws two-line cards and copies an id', async ($, on) => {
   const copied: string[] = []
-  engine(on as never, () => STDOUT, copied)
+  engine(on as never, () => pieces(STDOUT), copied)
 
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   const ran = await $.command.run({ command: 'sessions' })
@@ -85,15 +101,51 @@ test('/sessions draws two-line cards and copies an id', async ($, on) => {
 
 test('an unchanged transcript keeps the row it had', async ($, on) => {
   let stdout = STDOUT
-  engine(on as never, () => stdout, [])
+  engine(on as never, () => pieces(stdout), [])
 
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await $.command.run({ command: 'sessions' })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'refresh' })
-  stdout = 'TZ\t+0900\nKEEP\taaa\nKEEP\tbbb\nKEEP\tccc'
+  stdout = 'TZ\t+0900\nTOTAL\t3\t3\nKEEP\taaa\nKEEP\tbbb\nKEEP\tccc'
   await ui.press({ key: 'refresh' })
   expect(await ui.find({ type: 'Text', text: 'Opus 5.5 · $3.30' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a scan shows how far it got, then the newest under the limit', async ($, on) => {
+  let release = () => {}
+  const gate = new Promise<void>(resolve => (release = resolve))
+  const lines = STDOUT.split('\n').map(line => line.replace(/^TOTAL\t3\t3$/, 'TOTAL\t3\t250'))
+  engine(
+    on as never,
+    () =>
+      async function* () {
+        // The time zone, the count and one transcript, then a long one.
+        for (const line of lines.slice(0, 3)) yield { stream: 'stdout' as const, text: `${line}\n` }
+        await gate
+        for (const line of lines.slice(3)) yield { stream: 'stdout' as const, text: `${line}\n` }
+
+        return { code: 0, signal: null }
+      },
+    [],
+  )
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.command.run({ command: 'sessions' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const during = (await ui.findAll({ type: 'Text' })).map(el => el.text)
+  expect(during.some(text => /^. Reading 1 of 3$/.test(text))).toBe(true)
+  expect(during.some(text => text.includes('33%'))).toBe(true)
+  // The one read is drawn already.
+  expect(during).toContain('Old one')
+
+  release()
+  await ui.press({ key: 'refresh' })
+  const after = (await ui.findAll({ type: 'Text' })).map(el => el.text)
+  expect(after.some(text => text.startsWith('Newest 3 of 250 sessions on this machine'))).toBe(true)
+  expect(after.some(text => text.includes('Reading'))).toBe(false)
   await ui.unmount()
 })

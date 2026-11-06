@@ -9,6 +9,8 @@ Run `/sessions` to open it. Sessions are grouped into Today / This week / Earlie
 
 The ⧉ button copies the session ID to the clipboard, and ↻ Refresh scans again. Only transcripts that changed since the last scan are read again.
 
+While a scan runs, the header shows how many transcripts have been read (`⠹ Reading 37 of 100`) with a progress bar, and cards appear as they are read. A scan reads only the newest 100 transcripts by default; change **Sessions to read** (`maxSessions`, 10–5000) in the plugin's settings.
+
 The mod reads `~/.claude/projects/*/*.jsonl` with `sh`, `grep`, `awk`, `stat` and `date` (macOS and Linux).
 
 ## Install

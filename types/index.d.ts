@@ -22,11 +22,25 @@ export type SessionRow = {
   entrypoint?: string
 }
 
+export type Progress = {
+  /** Transcripts read so far, of `total` (the newest ones, up to the limit). */
+  done: number
+  total: number
+  /** Counts up on every redraw, for the spinner. */
+  frame: number
+}
+
 export type Listing = {
   rows: SessionRow[]
   error: string | null
   /** The machine's offset from UTC in seconds, so dates read as its own. */
   utcOffset?: number
+  /** Set while a scan runs. */
+  progress?: Progress
+  /** How many transcripts the machine holds, the limit aside. */
+  available?: number
+  /** How many of the newest transcripts a scan reads. */
+  limit?: number
 }
 
 declare module 'claude-code' {
