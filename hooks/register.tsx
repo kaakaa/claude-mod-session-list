@@ -7,17 +7,27 @@ const PANE = 'session-list'
 const SCAN = 4
 const listing = atom({ plugin: 'session-list', key: 'listing' } as const, null)
 
-// The first line is "TZ <offset>" (`date +%z`, e.g. +0900). Then one line per
-// transcript: a grep pass pulls the fields out and awk keeps the last value of
-// each (the first for the start, the entrypoint and the cwd), tab-separated.
-// A transcript whose "id:mtime" is in $KNOWN has not changed since the last
-// scan: it prints "KEEP <id>" and the module reuses the row it holds.
+const DEFAULT_LIMIT = 100
+// How many of the newest transcripts a scan reads; set from the options.
+let limit = DEFAULT_LIMIT
+// One scan at a time: a second press while one runs does nothing.
+let isScanning = false
+
+// The first line is "TZ <offset>" (`date +%z`, e.g. +0900), the second
+// "TOTAL <to read> <on the machine>": the newest $LIMIT transcripts by mtime
+// are read. Then one line per transcript, printed as it is read: a grep pass
+// pulls the fields out and awk keeps the last value of each (the first for the
+// start, the entrypoint and the cwd), tab-separated. A transcript whose
+// "id:mtime" is in $KNOWN has not changed since the last scan: it prints
+// "KEEP <id>" and the module reuses the row it holds.
 const SCRIPT = `
 printf 'TZ\\t%s\\n' "$(date +%z)"
-for f in "$HOME"/.claude/projects/*/*.jsonl; do
+all=$(ls -t "$HOME"/.claude/projects/*/*.jsonl 2>/dev/null)
+printf 'TOTAL\\t%s\\t%s\\n' "$(printf '%s\\n' "$all" | head -n "$LIMIT" | grep -c .)" "$(printf '%s\\n' "$all" | grep -c .)"
+printf '%s\\n' "$all" | head -n "$LIMIT" | while IFS= read -r f; do
   [ -f "$f" ] || continue
   id=$(basename "$f" .jsonl)
-  m=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f")
+  m=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f")
   case " $KNOWN " in *" $id:$m "*) printf 'KEEP\\t%s\\n' "$id"; continue;; esac
   rest=$(grep -oE '"(timestamp|entrypoint|cwd|customTitle|lastPrompt|gitBranch|prUrl)":"[^"]*"|"model":"claude-[^"]*"|"(totalCostUSD|totalLinesAdded|totalLinesRemoved|prNumber)":[0-9.]+' "$f" | awk -F'"' '
     { k = $2; v = ($3 == ":") ? $4 : substr($3, 2) }
@@ -70,47 +80,43 @@ function offsetSeconds(tz: string | undefined) {
   return (sign === '-' ? -1 : 1) * (Number(hours) * 3600 + Number(minutes) * 60)
 }
 
-function parse(stdout: string, known: readonly SessionRow[]): Listing {
-  const byId = new Map(known.map(row => [row.id, row]))
-  let utcOffset = 0
-  const rows = stdout
-    .split('\n')
-    .filter(line => line.trim() !== '')
-    .flatMap((line): SessionRow[] => {
-      const f = line.split('\t')
+type Line =
+  | { kind: 'tz'; utcOffset: number }
+  | { kind: 'total'; total: number; available: number }
+  | { kind: 'row'; row: SessionRow | undefined }
+  | { kind: 'none' }
 
-      if (f[0] === 'TZ') {
-        utcOffset = offsetSeconds(f[1])
+function parseLine(line: string, known: ReadonlyMap<string, SessionRow>): Line {
+  if (line.trim() === '') return { kind: 'none' }
 
-        return []
-      }
-      if (f[0] === 'KEEP') {
-        const kept = byId.get(f[1] ?? '')
+  const f = line.split('\t')
 
-        return kept ? [kept] : []
-      }
+  if (f[0] === 'TZ') return { kind: 'tz', utcOffset: offsetSeconds(f[1]) }
+  if (f[0] === 'TOTAL') return { kind: 'total', total: Number(f[1]) || 0, available: Number(f[2]) || 0 }
+  if (f[0] === 'KEEP') return { kind: 'row', row: known.get(f[1] ?? '') }
 
-      return [{
-        id: f[0] ?? '',
-        updatedAt: Number(f[1] ?? 0),
-        startedAt: num(f[2]),
-        scan: SCAN,
-        title: f[3] || '(untitled)',
-        branch: str(f[4]),
-        model: str(f[5]),
-        costUsd: num(f[6]),
-        linesAdded: num(f[7]),
-        linesRemoved: num(f[8]),
-        prNumber: num(f[9]),
-        prUrl: str(f[10]),
-        entrypoint: str(f[11]),
-        ...directory(str(f[12])),
-      }]
-    })
-    .sort((a, b) => b.updatedAt - a.updatedAt)
-
-  return { rows, error: null, utcOffset }
+  return {
+    kind: 'row',
+    row: {
+      id: f[0] ?? '',
+      updatedAt: Number(f[1] ?? 0),
+      startedAt: num(f[2]),
+      scan: SCAN,
+      title: f[3] || '(untitled)',
+      branch: str(f[4]),
+      model: str(f[5]),
+      costUsd: num(f[6]),
+      linesAdded: num(f[7]),
+      linesRemoved: num(f[8]),
+      prNumber: num(f[9]),
+      prUrl: str(f[10]),
+      entrypoint: str(f[11]),
+      ...directory(str(f[12])),
+    },
+  }
 }
+
+const newestFirst = (rows: readonly SessionRow[]) => [...rows].sort((a, b) => b.updatedAt - a.updatedAt)
 
 // A day number on the machine's own calendar.
 const dayOf = (epoch: number, offset: number) => Math.floor((epoch + offset) / 86400)
@@ -166,30 +172,122 @@ async function copyId($: EngineInterface, id: string, surface: RenderSurface) {
 }
 
 async function refresh($: EngineInterface) {
-  let next: Listing
-  // Rows an older scan wrote lack the newer fields: scan those again.
-  const known = ((await read($, listing))?.rows ?? []).filter(row => row.scan === SCAN)
-  const KNOWN = known.map(row => `${row.id}:${row.updatedAt}`).join(' ')
-
+  if (isScanning) return
+  isScanning = true
   try {
-    const run = await $.process.run(['sh', '-c', SCRIPT], {
-      timeoutMs: 60_000,
-      env: { KNOWN, LC_ALL: 'C' },
-    })
-    next =
-      run.exitCode === 0
-        ? parse(run.stdout, known)
-        : { rows: [], error: run.stderr.trim().split('\n')[0] ?? 'listing failed' }
-  } catch (error) {
-    next = { rows: [], error: String(error) }
+    await scan($)
+  } finally {
+    isScanning = false
   }
-
-  await update($, listing, () => next)
-
-  return next
 }
 
-export const register: Register = on => {
+// Reads the transcripts as the script prints them and redraws as it goes: the
+// rows read so far, over the ones held until each is read again, with a
+// "done of total" for the header.
+async function scan($: EngineInterface) {
+  const held = await read($, listing)
+  // Rows an older scan wrote lack the newer fields: scan those again.
+  const known = (held?.rows ?? []).filter(row => row.scan === SCAN)
+  const byId = new Map(known.map(row => [row.id, row]))
+  const KNOWN = known.map(row => `${row.id}:${row.updatedAt}`).join(' ')
+
+  const seen = new Map<string, SessionRow>()
+  let utcOffset = held?.utcOffset ?? 0
+  let available = held?.available
+  let progress = { done: 0, total: 0, frame: 0 }
+  let error: string | null = null
+  let stderr = ''
+  let pending = ''
+  let lastDraw = 0
+
+  const draw = (isDone: boolean) => {
+    progress = { ...progress, frame: progress.frame + 1 }
+    const rows = isDone ? [...seen.values()] : [...known.filter(row => !seen.has(row.id)), ...seen.values()]
+    const next: Listing = {
+      rows: newestFirst(rows),
+      error,
+      utcOffset,
+      available,
+      limit,
+      progress: isDone ? undefined : progress,
+    }
+
+    return update($, listing, () => next)
+  }
+  const take = (line: string) => {
+    const parsed = parseLine(line, byId)
+
+    if (parsed.kind === 'tz') utcOffset = parsed.utcOffset
+    if (parsed.kind === 'total') {
+      progress = { ...progress, total: parsed.total }
+      available = parsed.available
+    }
+    if (parsed.kind === 'row') {
+      progress = { ...progress, done: progress.done + 1 }
+      if (parsed.row) seen.set(parsed.row.id, parsed.row)
+    }
+  }
+
+  await draw(false)
+  try {
+    const child = $.process.spawn({
+      argv: ['sh', '-c', SCRIPT],
+      env: { KNOWN, LIMIT: String(limit), LC_ALL: 'C' },
+    })
+    let step = await child.next()
+
+    while (!step.done) {
+      const { stream, text } = step.value
+
+      if (stream === 'stderr') {
+        stderr += text
+      } else {
+        const lines = (pending + text).split('\n')
+        pending = lines.pop() ?? ''
+        lines.forEach(take)
+      }
+
+      // Redraw at most five times a second.
+      const now = await $.clock.now()
+      if (now - lastDraw >= 200) {
+        lastDraw = now
+        await draw(false)
+      }
+      step = await child.next()
+    }
+    take(pending)
+    if (step.value.code !== 0 && seen.size === 0) {
+      error = stderr.trim().split('\n')[0] || `scan ended with ${step.value.signal ?? step.value.code}`
+    }
+  } catch (caught) {
+    error = String(caught)
+  }
+
+  await draw(true)
+}
+
+const SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+const BAR = 24
+
+// "⠹ Reading 37 of 100" and a bar, from the scan's progress.
+function progressText(progress: { done: number; total: number; frame: number }) {
+  const spinner = SPINNER[progress.frame % SPINNER.length]
+  if (progress.total === 0) return { label: `${spinner} Finding sessions…`, bar: '' }
+
+  const done = Math.min(progress.done, progress.total)
+  const filled = Math.round((done / progress.total) * BAR)
+
+  return {
+    label: `${spinner} Reading ${done} of ${progress.total}`,
+    bar: `${'█'.repeat(filled)}${'░'.repeat(BAR - filled)} ${Math.floor((done / progress.total) * 100)}%`,
+  }
+}
+
+export const register: Register = (on, options) => {
+  if (typeof options.maxSessions === 'number' && options.maxSessions > 0) {
+    limit = Math.floor(options.maxSessions)
+  }
+
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'sessions',
@@ -210,27 +308,31 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Button, Link, Text } = $.ui.resolve(e)
     const held = await read($, listing)
-    // Rows an older version scanned lack what this one draws: show none of
-    // them until the scan that replaces them is done.
-    const state = held?.rows.some(row => row.scan !== SCAN) ? null : held
+    // Rows an older version scanned lack what this one draws: leave them out
+    // until the scan that replaces them reads them again.
+    const state: Listing = held
+      ? { ...held, rows: held.rows.filter(row => row.scan === SCAN) }
+      : { rows: [], error: null, progress: { done: 0, total: 0, frame: 0 } }
+    const progress = state.progress ? progressText(state.progress) : undefined
 
+    // A press while a scan runs does nothing; it stays so the place holds still.
     const refreshButton = (
       <Button key="refresh" label="↻ Refresh" plain dimColor onPress={() => refresh($)} />
     )
 
-    if (state === null) {
+    if (state.error) {
       return (
-        <Box flexDirection="row" justifyContent="space-between" paddingX={2} paddingY={1}>
-          <Text dimColor>Scanning sessions...</Text>
+        <Box flexDirection="column" paddingX={2} paddingY={1} gap={1}>
+          <Text color="error">Could not list sessions: {state.error}</Text>
           {refreshButton}
         </Box>
       )
     }
-    if (state.error) return <Text color="error">Could not list sessions: {state.error}</Text>
 
     const now = Math.floor((await $.clock.now()) / 1000)
     const offset = state.utcOffset ?? 0
     const total = state.rows.reduce((sum, row) => sum + (row.costUsd ?? 0), 0)
+    const isLimited = state.available !== undefined && state.limit !== undefined && state.available > state.limit
     const groups = ['Today', 'This week', 'Earlier']
       .map(name => ({
         name,
@@ -245,14 +347,29 @@ export const register: Register = on => {
             <Text size="title" weight="bold">
               Sessions
             </Text>
-            <Text size="caption" dimColor>
-              {state.rows.length} sessions on this machine · ${total.toFixed(2)} total
-            </Text>
+            {progress ? (
+              <Text size="caption" color="claude" tabular>
+                {progress.label}
+              </Text>
+            ) : (
+              <Text size="caption" dimColor>
+                {isLimited
+                  ? `Newest ${state.rows.length} of ${state.available} sessions on this machine`
+                  : `${state.rows.length} sessions on this machine`}{' '}
+                · ${total.toFixed(2)} total
+              </Text>
+            )}
           </Box>
           {refreshButton}
         </Box>
 
-        {state.rows.length === 0 && <Text dimColor>No sessions found.</Text>}
+        {progress?.bar && (
+          <Text size="caption" color="claude" mono tabular>
+            {progress.bar}
+          </Text>
+        )}
+
+        {!progress && state.rows.length === 0 && <Text dimColor>No sessions found.</Text>}
 
         {groups.map(group => (
           <Box key={`group-${group.name}`} flexDirection="column" gap={1}>
